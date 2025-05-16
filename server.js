@@ -2,9 +2,12 @@ const express = require('express');
 const cors = require('cors');
 const WebSocket = require('ws');
 const axios = require('axios');
+const path = require('path');
 require('dotenv').config();
 
 const app = express();
+
+const { downloadImages } = require('./imageDownloader');
 
 // Middleware
 app.use(cors());
@@ -30,20 +33,28 @@ function sendToClient(ip, message) {
 // Обработчик WebSocket соединений
 wss.on('connection', (ws, req) => {
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
-    console.log(`New WebSocket connection from ${ip}`);
-    
-    // Сохраняем соединение
+    console.log(`Новое подключение к WebSocket от ${ip}`);
     clients.set(ip, ws);
     
-    // Обработчик закрытия соединения
     ws.on('close', () => {
         clients.delete(ip);
-        console.log(`WebSocket connection closed for ${ip}`);
+        console.log(`Соединение с WebSocket закрыто для ${ip}`);
     });
 });
 
-const marketplaceQueue = [];
-let isPythonServerBusy = false;
+// Очередь задач для каждого IP
+const queues = new Map();
+
+// Функция для получения или создания очереди для IP
+function getQueueForIp(ip) {
+    if (!queues.has(ip)) {
+        queues.set(ip, {
+            tasks: [],
+            isProcessing: false
+        });
+    }
+    return queues.get(ip);
+}
 
 // Routes
 const authRoutes = require('./routes/authRoutes');
@@ -59,82 +70,140 @@ app.post('/api/search', (req, res) => {
         'DNS', 'Citilink', 'M_Video', 'Aliexpress', 
         'Joom', 'Shop_mts', 'Technopark', 'Lamoda'
     ];
+
+    // Получаем очередь для этого IP
+    const queue = getQueueForIp(ip);
     
-    // Добавляем в очередь
+    // Добавляем все маркетплейсы в очередь
     marketplaces.forEach(mp => {
-        marketplaceQueue.push({
+        queue.tasks.push({
             ip,
             query,
             marketplace: mp
         });
     });
     
-    // Запускаем обработку очереди
-    processQueue();
+    // Запускаем обработку очереди, если она еще не обрабатывается
+    if (!queue.isProcessing) {
+        processQueueForIp(ip);
+    }
     
     res.json({ status: 'Search started' });
 });
 
-// Функция для проверки статуса Python сервера
-async function checkPythonServerStatus() {
-    try {
-        const response = await axios.get('http://localhost:5000/status');
-        return response.data.status === 'ready';
-    } catch (error) {
-        console.error('Error checking Python server status:', error);
-        return false;
-    }
-}
-
-// Функция обработки очереди
-async function processQueue() {
-    if (isPythonServerBusy || marketplaceQueue.length === 0) return;
+// Функция для обработки очереди конкретного IP
+async function processQueueForIp(ip) {
+    const queue = getQueueForIp(ip);
+    if (queue.isProcessing || queue.tasks.length === 0) return;
     
-    const isServerReady = await checkPythonServerStatus();
-    if (!isServerReady) {
-        setTimeout(processQueue, 5000); // Повторная проверка через 5 секунд
-        return;
-    }
+    queue.isProcessing = true;
+    const task = queue.tasks[0]; // Берем первую задачу, но не удаляем ее сразу
     
-    isPythonServerBusy = true;
-    const task = marketplaceQueue.shift();
+    console.log(`Обработка: ${task.marketplace} для ${task.ip}`);
     
     try {
-        // Отправляем запрос на Python-сервер
-        const response = await axios.post('http://localhost:5000/parse', {
+        // Отправляем статус начала обработки
+        sendToClient(task.ip, {
+            type: 'status',
+            message: `${task.marketplace}: Начало парсинга`
+        });
+        
+        const response = await axios.post('http://192.168.1.4:5000/parse', {
             query: task.query,
             marketplace: task.marketplace,
             ip: task.ip
-        });
+        }, { timeout: 500000 }); // Увеличиваем таймаут до 500 секунд
         
-        // Обработка успешного ответа
+        // Ждем подтверждения завершения от Python сервера
+        await waitForCompletion(task.ip, task.marketplace);
+        
+        console.log(`Успешно обработан ${task.marketplace}`);
+        
+        // Удаляем выполненную задачу из очереди
+        queue.tasks.shift();
+        
+        // Отправляем статус завершения
         sendToClient(task.ip, {
-            type: 'data',
-            marketplace: task.marketplace,
-            data: response.data
+            type: 'status',
+            message: `${task.marketplace}: Парсинг завершен`
         });
         
     } catch (error) {
-        console.error(`Error processing ${task.marketplace}:`, error);
-        // Можно добавить логику повторной попытки или пропуска
+        console.error(`Ошибка обработки ${task.marketplace}:`, error);
+        
+        // Отправляем статус ошибки
+        sendToClient(task.ip, {
+            type: 'status',
+            message: `${task.marketplace}: Ошибка парсинга - ${error.message}`
+        });
+        
+        // В случае ошибки можно либо оставить задачу в очереди для повторения,
+        // либо пропустить ее и перейти к следующей
+        queue.tasks.shift(); // Пропускаем текущую задачу
     } finally {
-        isPythonServerBusy = false;
-        processQueue(); // Обрабатываем следующий элемент очереди
+        queue.isProcessing = false;
+        
+        // Проверяем, есть ли еще задачи в очереди
+        if (queue.tasks.length > 0) {
+            // Рекурсивно вызываем обработку следующей задачи
+            processQueueForIp(ip);
+        } else {
+            // Очередь пуста, можно удалить ее из хранилища
+            queues.delete(ip);
+        }
     }
 }
 
-// Добавляем обработчик для эндпоинта данных
-app.post('/api/data', (req, res) => {
+// Функция ожидания завершения (может быть улучшена)
+function waitForCompletion(ip, marketplace) {
+    return new Promise((resolve) => {
+        // В реальной реализации здесь можно использовать WebSocket
+        // для получения подтверждения от Python сервера
+        // Пока просто ждем фиксированное время
+        setTimeout(resolve, 30000); // 30 секунд
+    });
+}
+
+// Модифицируем обработчик /api/data
+app.post('/api/data', async (req, res) => {
+    console.log('Полученные данные:', req.body);
     const { ip, marketplace, data } = req.body;
     
-    // Отправляем данные клиенту через WebSocket
-    sendToClient(ip, {
-        type: 'data',
-        marketplace: marketplace,
-        data: data
-    });
-    
-    res.json({ status: 'Data received' });
+    try {
+        let processedData;
+        if (Array.isArray(data)) {
+            processedData = [];
+            for (const product of data) {
+                const processedProduct = await downloadImages(ip, marketplace, product);
+                processedData.push(processedProduct);
+            }
+        } else {
+            processedData = await downloadImages(ip, marketplace, data);
+        }
+        
+        // Отправляем обработанные данные клиенту
+        sendToClient(ip, {
+            type: 'data',
+            marketplace: marketplace,
+            data: processedData
+        });
+        
+        res.json({ 
+            status: 'success',
+            message: 'Data received and images downloaded successfully'
+        });
+    } catch (error) {
+        console.error('Ошибка при обработке данных:', error);
+        sendToClient(ip, {
+            type: 'error',
+            message: `Ошибка при загрузке изображений: ${error.message}`
+        });
+        res.status(500).json({ 
+            status: 'error',
+            error: 'Ошибка при обработке данных',
+            details: error.message
+        });
+    }
 });
 
 // Добавляем обработчик для эндпоинта статусов
@@ -149,6 +218,9 @@ app.post('/api/status', (req, res) => {
     
     res.json({ status: 'Status received' });
 });
+
+// Добавьте в server.js перед запуском сервера
+app.use('/images', express.static(path.join(__dirname, 'images')));
 
 // Error handling
 app.use((err, req, res, next) => {
