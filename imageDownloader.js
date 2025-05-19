@@ -47,7 +47,6 @@ async function downloadImages(ip, marketplace, productData) {
             }
         }
 
-        // Заменяем image_urls на скачанные файлы
         productData.images = downloadedImages;
         delete productData.image_urls;
 
